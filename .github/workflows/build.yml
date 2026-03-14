@@ -28,11 +28,6 @@ jobs:
       image: debian:11
 
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive
-
       - name: Install deps (Debian 11)
         shell: bash
         run: |
@@ -52,6 +47,11 @@ jobs:
             xz-utils \
             binutils
           rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
 
       - name: Git safe directory (container)
         shell: bash
