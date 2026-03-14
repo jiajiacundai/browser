@@ -1,192 +1,105 @@
-name: nightly build
+name: debian11 x86_64 build
 
 env:
-  AWS_ACCESS_KEY_ID: ${{ vars.NIGHTLY_BUILD_AWS_ACCESS_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.NIGHTLY_BUILD_AWS_SECRET_ACCESS_KEY }}
-  AWS_BUCKET: ${{ vars.NIGHTLY_BUILD_AWS_BUCKET }}
-  AWS_REGION: ${{ vars.NIGHTLY_BUILD_AWS_REGION }}
-  RELEASE: ${{ github.ref_type == 'tag' && github.ref_name || 'nightly' }}
+  RELEASE: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag || 'nightly' }}
 
 on:
   push:
     tags:
-      - '*'
-  schedule:
-    - cron: "2 2 * * *"
+      - "*"
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/update when manually triggered"
+        required: false
+        default: "nightly"
 
 permissions:
   contents: write
 
 jobs:
-  build-linux-x86_64:
-    env:
-      ARCH: x86_64
-      OS: linux
-
+  build-debian11-x86_64:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 240
 
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          # fetch submodules recusively, to get zig-js-runtime submodules also.
-          submodules: recursive
-
-      - uses: ./.github/actions/install
-        with:
-          os: ${{env.OS}}
-          arch: ${{env.ARCH}}
-
-      - name: v8 snapshot
-        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
-
-      - name: zig build
-        run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dcpu=x86_64 -Dgit_commit=$(git rev-parse --short ${{ github.sha }})
-
-      - name: Rename binary
-        run: mv zig-out/bin/lightpanda lightpanda-${{ env.ARCH }}-${{ env.OS }}
-
-      - name: upload on s3
-        run: |
-          export DIR=`git show --no-patch --no-notes --pretty='%cs_%h'`
-          aws s3 cp --storage-class=GLACIER_IR lightpanda-${{ env.ARCH }}-${{ env.OS }} s3://lpd-nightly-build/${DIR}/lightpanda-${{ env.ARCH }}-${{ env.OS }}
-
-      - name: Upload the build
-        uses: ncipollo/release-action@v1
-        with:
-          allowUpdates: true
-          artifacts: lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          tag: ${{ env.RELEASE }}
-          makeLatest: true
-
-  build-linux-aarch64:
-    env:
-      ARCH: aarch64
-      OS: linux
-
-    runs-on: ubuntu-22.04-arm
-    timeout-minutes: 20
+    container:
+      image: debian:11
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # fetch submodules recusively, to get zig-js-runtime submodules also.
           submodules: recursive
 
-      - uses: ./.github/actions/install
-        with:
-          os: ${{env.OS}}
-          arch: ${{env.ARCH}}
-
-      - name: v8 snapshot
-        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
-
-      - name: zig build
-        run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dcpu=generic -Dgit_commit=$(git rev-parse --short ${{ github.sha }})
-
-      - name: Rename binary
-        run: mv zig-out/bin/lightpanda lightpanda-${{ env.ARCH }}-${{ env.OS }}
-
-      - name: upload on s3
+      - name: Install deps (Debian 11)
+        shell: bash
         run: |
-          export DIR=`git show --no-patch --no-notes --pretty='%cs_%h'`
-          aws s3 cp --storage-class=GLACIER_IR lightpanda-${{ env.ARCH }}-${{ env.OS }} s3://lpd-nightly-build/${DIR}/lightpanda-${{ env.ARCH }}-${{ env.OS }}
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            clang \
+            build-essential \
+            curl \
+            git \
+            make \
+            pkg-config \
+            libglib2.0-dev \
+            python3 \
+            xz-utils \
+            binutils
+          rm -rf /var/lib/apt/lists/*
 
-      - name: Upload the build
+      - name: Git safe directory (container)
+        shell: bash
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Install Rust (rustup)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+
+      - name: Install Zig 0.15.2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp
+          curl -L -o zig-x86_64-linux-0.15.2.tar.xz \
+            https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+          mkdir -p /opt
+          tar -xJf zig-x86_64-linux-0.15.2.tar.xz -C /opt
+          mv /opt/zig-x86_64-linux-0.15.2 /opt/zig-0.15.2
+          echo "/opt/zig-0.15.2" >> "${GITHUB_PATH}"
+          /opt/zig-0.15.2/zig version
+
+      - name: Build (ReleaseFast, baseline CPU)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu -Dcpu=baseline -j"$(nproc)" \
+            snapshot_creator -- src/snapshot.bin
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu -Dcpu=baseline -j"$(nproc)" \
+            -Dsnapshot_path=../../snapshot.bin \
+            -Dgit_commit="$(git rev-parse --short HEAD)"
+          strip --strip-unneeded zig-out/bin/lightpanda || strip zig-out/bin/lightpanda
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          pkg="lightpanda-debian11-x86_64.tar.gz"
+          tar -C zig-out/bin -czf "${pkg}" lightpanda
+          sha256sum zig-out/bin/lightpanda "${pkg}" > "${pkg}.sha256"
+
+      - name: Upload to GitHub Releases
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
-          artifacts: lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          tag: ${{ env.RELEASE }}
-          makeLatest: true
-
-  build-macos-aarch64:
-    env:
-      ARCH: aarch64
-      OS: macos
-
-    # macos-14 runs on arm CPU. see
-    # https://github.com/actions/runner-images?tab=readme-ov-file
-    runs-on: macos-14
-    timeout-minutes: 20
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          # fetch submodules recusively, to get zig-js-runtime submodules also.
-          submodules: recursive
-
-      - uses: ./.github/actions/install
-        with:
-          os: ${{env.OS}}
-          arch: ${{env.ARCH}}
-
-      - name: v8 snapshot
-        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
-
-      - name: zig build
-        run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dgit_commit=$(git rev-parse --short ${{ github.sha }})
-
-      - name: Rename binary
-        run: mv zig-out/bin/lightpanda lightpanda-${{ env.ARCH }}-${{ env.OS }}
-
-      - name: upload on s3
-        run: |
-          export DIR=`git show --no-patch --no-notes --pretty='%cs_%h'`
-          aws s3 cp --storage-class=GLACIER_IR lightpanda-${{ env.ARCH }}-${{ env.OS }} s3://lpd-nightly-build/${DIR}/lightpanda-${{ env.ARCH }}-${{ env.OS }}
-
-      - name: Upload the build
-        uses: ncipollo/release-action@v1
-        with:
-          allowUpdates: true
-          artifacts: lightpanda-${{ env.ARCH }}-${{ env.OS }}
-          tag: ${{ env.RELEASE }}
-          makeLatest: true
-
-  build-macos-x86_64:
-    env:
-      ARCH: x86_64
-      OS: macos
-
-    runs-on: macos-14-large
-    timeout-minutes: 20
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          # fetch submodules recusively, to get zig-js-runtime submodules also.
-          submodules: recursive
-
-      - uses: ./.github/actions/install
-        with:
-          os: ${{env.OS}}
-          arch: ${{env.ARCH}}
-
-      - name: v8 snapshot
-        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
-
-      - name: zig build
-        run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dgit_commit=$(git rev-parse --short ${{ github.sha }})
-
-      - name: Rename binary
-        run: mv zig-out/bin/lightpanda lightpanda-${{ env.ARCH }}-${{ env.OS }}
-
-      - name: upload on s3
-        run: |
-          export DIR=`git show --no-patch --no-notes --pretty='%cs_%h'`
-          aws s3 cp --storage-class=GLACIER_IR lightpanda-${{ env.ARCH }}-${{ env.OS }} s3://lpd-nightly-build/${DIR}/lightpanda-${{ env.ARCH }}-${{ env.OS }}
-
-      - name: Upload the build
-        uses: ncipollo/release-action@v1
-        with:
-          allowUpdates: true
-          artifacts: lightpanda-${{ env.ARCH }}-${{ env.OS }}
+          artifacts: "lightpanda-debian11-x86_64.tar.gz,lightpanda-debian11-x86_64.tar.gz.sha256"
           tag: ${{ env.RELEASE }}
           makeLatest: true
